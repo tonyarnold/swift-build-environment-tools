@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "macOS Universal"
+            runner: macos-15
+            platform: "macOS"
+            xcode: "16.4"
+            arch: "universal"
+            comprehensive_test: true
+            lint_check: true
+          - name: "Linux x86_64"
+            runner: ubuntu-latest
+            platform: "Linux"
+            arch: "x86_64"
+            triple: "x86_64-unknown-linux-gnu"
+            comprehensive_test: true
+            lint_check: true
+          - name: "Linux ARM64"
+            runner: ubuntu-24.04-arm
+            platform: "Linux"
+            arch: "aarch64"
+            triple: "aarch64-unknown-linux-gnu"
+            comprehensive_test: true
+            lint_check: true
+
+    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.name }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Xcode
+      if: matrix.platform == 'macOS'
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: ${{ matrix.xcode }}
+
+    - name: Setup Swift (Linux only)
+      if: matrix.platform == 'Linux'
+      run: |
+        # Check if Swift is already available
+        if command -v swift >/dev/null 2>&1; then
+          echo "Swift is already available:"
+          swift --version
+        else
+          echo "Installing Swift using Swiftly..."
+
+          # Install Swiftly
+          curl -L https://swift-server.github.io/swiftly/swiftly-install.sh | bash
+
+          # Add Swiftly to PATH for current session
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+          # Install latest Swift toolchain
+          swiftly install latest
+          swiftly use latest
+
+          echo "Swift installation completed:"
+          swift --version
+        fi
+
+    - name: Cache Swift Package Manager
+      uses: actions/cache@v4
+      with:
+        path: |
+          .build
+          ~/.cache/org.swift.swiftpm
+        key: ${{ runner.os }}-${{ matrix.arch }}-spm-${{ hashFiles('Package.swift', 'Package.resolved') }}-ci
+        restore-keys: |
+          ${{ runner.os }}-${{ matrix.arch }}-spm-
+
+    - name: Swift format lint (check only)
+      if: matrix.lint_check
+      run: |
+        if command -v swift-format >/dev/null 2>&1; then
+          swift-format lint --recursive Sources/ Plugins/
+        else
+          echo "swift-format not available, skipping lint check"
+        fi
+
+    - name: Build package
+      run: |
+        if [ "${{ matrix.platform }}" = "macOS" ] && [ "${{ matrix.arch }}" = "universal" ]; then
+          # Build universal binary for macOS
+          swift build --configuration release --arch arm64
+          swift build --configuration release --arch x86_64
+        elif [ "${{ matrix.platform }}" = "Linux" ]; then
+          swift build --configuration release --triple ${{ matrix.triple }} --static-swift-stdlib
+        else
+          swift build --configuration release
+        fi
+
+    - name: Run tests
+      if: matrix.comprehensive_test
+      run: swift test
+
+    - name: Smoke test CLI tools
+      if: matrix.comprehensive_test
+      run: |
+        # Basic smoke tests - just verify help works
+        swift run BuildEnvironmentExtractor --help
+        swift run GitInfoExtractor --help

@@ -1,0 +1,428 @@
+name: Release
+
+on:
+  push:
+    tags: ["*"]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Tag name for the release"
+        required: true
+        default: "1.0.0"
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "macOS Universal"
+            runner: macos-15
+            platform: "macOS"
+            xcode: "16.4"
+            arch: "universal"
+          - name: "Linux x86_64"
+            runner: ubuntu-latest
+            platform: "Linux"
+            arch: "x86_64"
+            triple: "x86_64-unknown-linux-gnu"
+          - name: "Linux ARM64"
+            runner: ubuntu-24.04-arm
+            platform: "Linux"
+            arch: "aarch64"
+            triple: "aarch64-unknown-linux-gnu"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Select Xcode version (macOS only)
+        if: matrix.platform == 'macOS'
+        run: sudo xcode-select -s /Applications/Xcode_${{ matrix.xcode }}.app/Contents/Developer
+
+      - name: Setup Swift (Linux only)
+        if: matrix.platform == 'Linux'
+        run: |
+          # Check if Swift is already available
+          if command -v swift >/dev/null 2>&1; then
+            echo "Swift is already available:"
+            swift --version
+          else
+            echo "Installing Swift using Swiftly..."
+
+            # Install Swiftly
+            curl -L https://swift-server.github.io/swiftly/swiftly-install.sh | bash
+
+            # Add Swiftly to PATH for current session
+            export PATH="$HOME/.local/bin:$PATH"
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+            # Install latest Swift toolchain
+            swiftly install latest
+            swiftly use latest
+
+            echo "Swift installation completed:"
+            swift --version
+          fi
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Cache Swift Package Manager
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build
+            ~/.cache/org.swift.swiftpm
+          key: ${{ runner.os }}-${{ matrix.arch }}-spm-release-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.arch }}-spm-
+            ${{ runner.os }}-spm-
+
+      - name: Resolve dependencies
+        run: swift package resolve
+
+      - name: Build optimized binary
+        run: |
+          # Show version that will be detected
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.tag_name }}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/}
+          fi
+          VERSION=${VERSION#v}  # Remove 'v' prefix if present
+
+          if [ "${{ matrix.platform }}" = "macOS" ]; then
+            echo "Building universal macOS binaries (version will be detected as: $VERSION)..."
+
+            # Build ARM64 binaries
+            echo "Building ARM64 binaries..."
+            swift build --configuration release --arch arm64 -Xswiftc -Osize
+
+            # Build x86_64 binaries
+            echo "Building x86_64 binaries..."
+            swift build --configuration release --arch x86_64 -Xswiftc -Osize
+
+            # Create output directory
+            mkdir -p .build/apple/Products/Release
+
+            # Combine architectures with lipo for both executables
+            echo "Combining architectures with lipo..."
+            lipo -create \
+              .build/arm64-apple-macosx/release/BuildEnvironmentExtractor \
+              .build/x86_64-apple-macosx/release/BuildEnvironmentExtractor \
+              -output .build/apple/Products/Release/BuildEnvironmentExtractor
+
+            lipo -create \
+              .build/arm64-apple-macosx/release/GitInfoExtractor \
+              .build/x86_64-apple-macosx/release/GitInfoExtractor \
+              -output .build/apple/Products/Release/GitInfoExtractor
+
+            # Verify the universal binaries
+            echo "Verifying universal binaries..."
+            lipo -info .build/apple/Products/Release/BuildEnvironmentExtractor
+            lipo -info .build/apple/Products/Release/GitInfoExtractor
+
+            # Strip the final binaries
+            strip -rSTx .build/apple/Products/Release/BuildEnvironmentExtractor
+            strip -rSTx .build/apple/Products/Release/GitInfoExtractor
+          else
+            echo "Building static Linux binaries for ${{ matrix.arch }} (version will be detected as: $VERSION)..."
+            swift build --configuration release --triple ${{ matrix.triple }} -Xswiftc -Osize --static-swift-stdlib
+            strip .build/${{ matrix.triple }}/release/BuildEnvironmentExtractor
+            strip .build/${{ matrix.triple }}/release/GitInfoExtractor
+          fi
+
+      - name: Basic functionality test
+        run: |
+          if [ "${{ matrix.platform }}" = "macOS" ]; then
+            BUILDENV_PATH=".build/apple/Products/Release/BuildEnvironmentExtractor"
+            GITINFO_PATH=".build/apple/Products/Release/GitInfoExtractor"
+          else
+            BUILDENV_PATH=".build/${{ matrix.triple }}/release/BuildEnvironmentExtractor"
+            GITINFO_PATH=".build/${{ matrix.triple }}/release/GitInfoExtractor"
+          fi
+
+          echo "Testing basic functionality..."
+          $BUILDENV_PATH --help > /dev/null
+          $GITINFO_PATH --help > /dev/null
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform == 'macOS' && 'swift-build-environment-tools-macos' || format('swift-build-environment-tools-linux-{0}', matrix.arch) }}
+          path: |
+            ${{ matrix.platform == 'macOS' && '.build/apple/Products/Release/BuildEnvironmentExtractor' || format('.build/{0}/release/BuildEnvironmentExtractor', matrix.triple) }}
+            ${{ matrix.platform == 'macOS' && '.build/apple/Products/Release/GitInfoExtractor' || format('.build/{0}/release/GitInfoExtractor', matrix.triple) }}
+          retention-days: 30
+
+  create-release:
+    name: "Create Release"
+    runs-on: ubuntu-latest
+    needs: [build]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Setup artifact structure
+        run: |
+          # Create the build directory structure expected by our script
+          mkdir -p .build/apple/Products/Release
+          mkdir -p .build/x86_64-unknown-linux-gnu/release
+          mkdir -p .build/aarch64-unknown-linux-gnu/release
+
+          # Copy binaries to expected locations
+          cp swift-build-environment-tools-macos/BuildEnvironmentExtractor .build/apple/Products/Release/
+          cp swift-build-environment-tools-macos/GitInfoExtractor .build/apple/Products/Release/
+          cp swift-build-environment-tools-linux-x86_64/BuildEnvironmentExtractor .build/x86_64-unknown-linux-gnu/release/
+          cp swift-build-environment-tools-linux-x86_64/GitInfoExtractor .build/x86_64-unknown-linux-gnu/release/
+          cp swift-build-environment-tools-linux-aarch64/BuildEnvironmentExtractor .build/aarch64-unknown-linux-gnu/release/
+          cp swift-build-environment-tools-linux-aarch64/GitInfoExtractor .build/aarch64-unknown-linux-gnu/release/
+
+          # Make binaries executable
+          chmod +x .build/apple/Products/Release/*
+          chmod +x .build/x86_64-unknown-linux-gnu/release/*
+          chmod +x .build/aarch64-unknown-linux-gnu/release/*
+
+      - name: Install 7zip
+        run: sudo apt-get update && sudo apt-get install -y p7zip-full
+
+      - name: Create artifact bundle using scripts
+        run: |
+          # Get version from git tag or manual input
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.tag_name }}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/}
+          fi
+          echo "Creating artifact bundles for version $VERSION using scripts"
+
+          # Create artifact bundles using existing binaries (skip rebuild)
+          chmod +x Scripts/spm-artifact-bundle.sh
+
+          # Run script with error handling for missing Linux binaries
+          if ! ./Scripts/spm-artifact-bundle.sh "${VERSION#v}"; then
+            echo "❌ Artifact bundle creation failed"
+            echo "=== Debug: Checking directory structure ==="
+            find .build -type f -name "BuildEnvironmentExtractor" -exec ls -la {} \; || echo "No BuildEnvironmentExtractor binaries found"
+            find .build -type f -name "GitInfoExtractor" -exec ls -la {} \; || echo "No GitInfoExtractor binaries found"
+            exit 1
+          fi
+
+      - name: Create traditional release archives
+        run: |
+          # Get version
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.tag_name }}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/}
+          fi
+          VERSION=${VERSION#v}  # Remove 'v' prefix if present
+
+          # Create directories for archives
+          mkdir -p release
+
+          # Universal macOS binary
+          mkdir -p "swift-build-environment-tools-$VERSION-macos-universal"
+          cp .build/apple/Products/Release/BuildEnvironmentExtractor "swift-build-environment-tools-$VERSION-macos-universal/"
+          cp .build/apple/Products/Release/GitInfoExtractor "swift-build-environment-tools-$VERSION-macos-universal/"
+          cp LICENSE "swift-build-environment-tools-$VERSION-macos-universal/" || echo "No LICENSE file found"
+          cp README.md "swift-build-environment-tools-$VERSION-macos-universal/" || echo "No README.md file found"
+          tar -czf "release/swift-build-environment-tools-$VERSION-macos-universal.tar.gz" "swift-build-environment-tools-$VERSION-macos-universal"
+
+          # Linux x86_64 binary
+          mkdir -p "swift-build-environment-tools-$VERSION-linux-x86_64"
+          cp .build/x86_64-unknown-linux-gnu/release/BuildEnvironmentExtractor "swift-build-environment-tools-$VERSION-linux-x86_64/"
+          cp .build/x86_64-unknown-linux-gnu/release/GitInfoExtractor "swift-build-environment-tools-$VERSION-linux-x86_64/"
+          cp LICENSE "swift-build-environment-tools-$VERSION-linux-x86_64/" || echo "No LICENSE file found"
+          cp README.md "swift-build-environment-tools-$VERSION-linux-x86_64/" || echo "No README.md file found"
+          tar -czf "release/swift-build-environment-tools-$VERSION-linux-x86_64.tar.gz" "swift-build-environment-tools-$VERSION-linux-x86_64"
+
+          # Linux ARM64 binary
+          mkdir -p "swift-build-environment-tools-$VERSION-linux-aarch64"
+          cp .build/aarch64-unknown-linux-gnu/release/BuildEnvironmentExtractor "swift-build-environment-tools-$VERSION-linux-aarch64/"
+          cp .build/aarch64-unknown-linux-gnu/release/GitInfoExtractor "swift-build-environment-tools-$VERSION-linux-aarch64/"
+          cp LICENSE "swift-build-environment-tools-$VERSION-linux-aarch64/" || echo "No LICENSE file found"
+          cp README.md "swift-build-environment-tools-$VERSION-linux-aarch64/" || echo "No README.md file found"
+          tar -czf "release/swift-build-environment-tools-$VERSION-linux-aarch64.tar.gz" "swift-build-environment-tools-$VERSION-linux-aarch64"
+
+      - name: Generate checksums
+        run: |
+          cd release
+          # Use portable checksum command
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 *.tar.gz > checksums.txt
+          elif command -v sha256sum >/dev/null 2>&1; then
+            sha256sum *.tar.gz > checksums.txt
+          else
+            echo "❌ No checksum tool available"
+            exit 1
+          fi
+          cat checksums.txt
+
+      - name: Generate release notes
+        run: |
+          # Get version from git tag or manual input
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.tag_name }}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/}
+          fi
+
+          # Make script executable and generate release notes
+          chmod +x Scripts/generate-release-notes.sh
+
+          # Try to extract specific version, fallback to unreleased
+          if ./Scripts/generate-release-notes.sh "$VERSION" > release_notes.md 2>/dev/null; then
+            echo "✅ Generated release notes from CHANGELOG.md for $VERSION"
+          elif ./Scripts/generate-release-notes.sh "unreleased" > release_notes.md 2>/dev/null; then
+            echo "⚠️  Specific version not found, using unreleased section"
+          else
+            echo "⚠️  Could not extract from CHANGELOG.md, using fallback"
+            cat > release_notes.md << 'EOF'
+          ## Release Notes
+
+          This release includes improvements and bug fixes. See the full changelog for details.
+          EOF
+          fi
+
+          # Add installation instructions to release notes
+          cat >> release_notes.md << 'EOF'
+
+          ## Binary Target Usage (Swift Package Manager Plugin)
+
+          Add these to your Package.swift for build tool plugin usage:
+
+          ### BuildEnvironmentExtractor
+          ```swift
+          .binaryTarget(
+              name: "BuildEnvironmentExtractorBinary",
+              url: "https://github.com/tonyarnold/swift-build-environment-tools/releases/download/${{ github.ref_name }}/BuildEnvironmentExtractor.artifactbundle.zip",
+              checksum: "$(cat BuildEnvironmentExtractor.artifactbundle.zip.checksum)"
+          )
+          ```
+
+          ### GitInfoExtractor
+          ```swift
+          .binaryTarget(
+              name: "GitInfoExtractorBinary",
+              url: "https://github.com/tonyarnold/swift-build-environment-tools/releases/download/${{ github.ref_name }}/GitInfoExtractor.artifactbundle.zip",
+              checksum: "$(cat GitInfoExtractor.artifactbundle.zip.checksum)"
+          )
+          ```
+
+          ## Manual Installation
+
+          Download the appropriate binary for your system:
+
+          - **Universal macOS** (recommended): `swift-build-environment-tools-${{ github.ref_name }}-macos-universal.tar.gz`
+          - **Linux x86_64**: `swift-build-environment-tools-${{ github.ref_name }}-linux-x86_64.tar.gz`
+          - **Linux ARM64**: `swift-build-environment-tools-${{ github.ref_name }}-linux-aarch64.tar.gz`
+
+          ### Quick Install (macOS)
+          ```bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/swift-build-environment-tools-${{ github.ref_name }}-macos-universal.tar.gz | tar -xz
+          sudo mv swift-build-environment-tools-${{ github.ref_name }}-macos-universal/BuildEnvironmentExtractor /usr/local/bin/
+          sudo mv swift-build-environment-tools-${{ github.ref_name }}-macos-universal/GitInfoExtractor /usr/local/bin/
+          ```
+
+          ### Quick Install (Linux)
+          ```bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/swift-build-environment-tools-${{ github.ref_name }}-linux-x86_64.tar.gz | tar -xz
+          sudo mv swift-build-environment-tools-${{ github.ref_name }}-linux-x86_64/BuildEnvironmentExtractor /usr/local/bin/
+          sudo mv swift-build-environment-tools-${{ github.ref_name }}-linux-x86_64/GitInfoExtractor /usr/local/bin/
+          ```
+
+          ## Supported Platforms
+
+          - macOS (Universal: ARM64 + x86_64)
+          - Linux x86_64 (static binary, no Swift runtime required)
+          - Linux ARM64 (static binary, no Swift runtime required)
+
+          ## Plugin Usage
+
+          The binary targets can be used with the build tool plugins for automatic dependency extraction during builds.
+
+          ## Checksums
+          All binaries are signed with SHA256 checksums available in `checksums.txt`.
+          EOF
+
+      - name: Update Package.swift with binary targets
+        run: |
+          # Get version
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.tag_name }}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/}
+          fi
+
+          # Update Package.swift with actual checksum and version using the script
+          chmod +x Scripts/update-artifact-bundle.sh
+          ./Scripts/update-artifact-bundle.sh "$VERSION"
+
+      - name: Commit updated Package.swift to release branch
+        run: |
+          # Configure git for GitHub Actions bot
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Get version
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.tag_name }}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/}
+          fi
+
+          # Create and switch to release branch
+          RELEASE_BRANCH="release/${VERSION}"
+          git checkout -b "$RELEASE_BRANCH"
+
+          # Add and commit the updated Package.swift
+          git add Package.swift
+          git commit -m "Release Package.swift for $VERSION
+
+          - Production Package.swift with binary targets
+          - Updated binary target URLs for $VERSION
+          - BuildEnvironmentExtractor checksum: $(cat BuildEnvironmentExtractor.artifactbundle.zip.checksum)
+          - GitInfoExtractor checksum: $(cat GitInfoExtractor.artifactbundle.zip.checksum)
+
+          🤖 Automated release commit"
+
+          # Push the release branch
+          git push origin "$RELEASE_BRANCH"
+
+          # Update the release tag to point to this commit
+          git tag -f "$VERSION"
+          git push origin --tags --force
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: github.event_name == 'push'
+        with:
+          files: |
+            BuildEnvironmentExtractor.artifactbundle.zip
+            GitInfoExtractor.artifactbundle.zip
+            release/*.tar.gz
+            release/checksums.txt
+          body_path: release_notes.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifacts for manual dispatch
+        uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          name: release-binaries
+          path: |
+            BuildEnvironmentExtractor.artifactbundle.zip
+            GitInfoExtractor.artifactbundle.zip
+            release/*.tar.gz
+            release/checksums.txt
+          retention-days: 30
